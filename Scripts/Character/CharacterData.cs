@@ -17,8 +17,12 @@ public class CharacterData
     public int gold = 100;
     
     [Header("属性")]
-    public CharacterStats baseStats;
-    public CharacterStats totalStats;
+    [SerializeField]
+    private CharacterStats _baseStats;
+    [SerializeField]
+    private CharacterStats _totalStats;
+    [SerializeField]
+    private CharacterStats _equipmentStatsCache;
     
     [Header("技能")]
     public List<SkillInstance> skills;
@@ -32,6 +36,38 @@ public class CharacterData
     public List<QuestInstance> activeQuests;
     public List<QuestInstance> completedQuests;
     
+    [Header("装备状态标记")]
+    private HashSet<int> _equippedItemIds = new HashSet<int>();
+    private bool _isStatsDirty = true;
+    
+    public CharacterStats baseStats
+    {
+        get { return _baseStats; }
+        set 
+        { 
+            _baseStats = value; 
+            _isStatsDirty = true;
+        }
+    }
+    
+    public CharacterStats totalStats
+    {
+        get 
+        {
+            if (_isStatsDirty)
+            {
+                CalculateTotalStats();
+            }
+            return _totalStats; 
+        }
+        private set { _totalStats = value; }
+    }
+    
+    public CharacterStats equipmentStatsCache
+    {
+        get { return _equipmentStatsCache; }
+    }
+    
     public void Initialize(ClassConfig config)
     {
         classConfig = config;
@@ -40,9 +76,14 @@ public class CharacterData
         experience = 0;
         experienceToNextLevel = CalculateExperienceToNextLevel(level);
         
-        baseStats = config.baseStats;
-        currentHealth = baseStats.maxHealth;
-        currentMana = baseStats.maxMana;
+        _baseStats = config.baseStats.DeepCopy();
+        _totalStats = new CharacterStats();
+        _equipmentStatsCache = new CharacterStats();
+        _equippedItemIds = new HashSet<int>();
+        _isStatsDirty = true;
+        
+        currentHealth = _baseStats.maxHealth;
+        currentMana = _baseStats.maxMana;
         
         skills = new List<SkillInstance>();
         skillCooldowns = new List<float>();
@@ -59,6 +100,8 @@ public class CharacterData
         completedQuests = new List<QuestInstance>();
         
         CalculateTotalStats();
+        
+        Debug.Log($"[CharacterData] 初始化角色：{characterName}，基础属性：{_baseStats}");
     }
     
     public void AddExperience(int amount)
@@ -76,13 +119,14 @@ public class CharacterData
         level++;
         experienceToNextLevel = CalculateExperienceToNextLevel(level);
         
-        baseStats += classConfig.perLevelStats;
-        currentHealth = baseStats.maxHealth;
-        currentMana = baseStats.maxMana;
+        _baseStats += classConfig.perLevelStats;
+        currentHealth = _baseStats.maxHealth;
+        currentMana = _baseStats.maxMana;
+        _isStatsDirty = true;
         
         CalculateTotalStats();
         
-        Debug.Log($"等级提升！当前等级：{level}");
+        Debug.Log($"[CharacterData] 等级提升！当前等级：{level}，新基础属性：{_baseStats}");
     }
     
     private int CalculateExperienceToNextLevel(int currentLevel)
@@ -92,55 +136,211 @@ public class CharacterData
     
     public void CalculateTotalStats()
     {
-        totalStats = baseStats;
-        
-        foreach (var equippedItem in equippedItems.Values)
+        if (_baseStats == null)
         {
-            if (equippedItem != null)
-            {
-                totalStats += equippedItem.GetTotalStats();
-            }
+            Debug.LogError("[CharacterData] baseStats 为空！");
+            return;
         }
+        
+        _totalStats = _baseStats.DeepCopy();
+        
+        if (_equipmentStatsCache == null)
+        {
+            _equipmentStatsCache = new CharacterStats();
+        }
+        _equipmentStatsCache.Reset();
+        
+        if (_equippedItemIds == null)
+        {
+            _equippedItemIds = new HashSet<int>();
+        }
+        _equippedItemIds.Clear();
+        
+        int equipmentCount = 0;
+        
+        foreach (var kvp in equippedItems)
+        {
+            EquipmentSlot slot = kvp.Key;
+            EquipmentInstance equippedItem = kvp.Value;
+            
+            if (equippedItem == null || equippedItem.config == null)
+            {
+                continue;
+            }
+            
+            int itemId = equippedItem.config.equipmentId;
+            
+            if (_equippedItemIds.Contains(itemId))
+            {
+                Debug.LogWarning($"[CharacterData] 检测到重复装备！槽位 {slot} 中的物品 ID {itemId} 已存在，跳过计算");
+                continue;
+            }
+            
+            _equippedItemIds.Add(itemId);
+            
+            CharacterStats itemStats = equippedItem.GetTotalStats();
+            _equipmentStatsCache += itemStats;
+            _totalStats += itemStats;
+            equipmentCount++;
+            
+            Debug.Log($"[CharacterData] 计算装备属性：槽位={slot}, 物品={equippedItem.config.equipmentName}, 属性加成={itemStats}");
+        }
+        
+        _isStatsDirty = false;
+        
+        Debug.Log($"[CharacterData] 属性计算完成 - 装备数量：{equipmentCount}, 装备加成：{_equipmentStatsCache}, 总属性：{_totalStats}");
     }
     
     public bool EquipItem(EquipmentInstance item)
     {
+        if (item == null || item.config == null)
+        {
+            Debug.LogError("[CharacterData] 尝试装备空物品！");
+            return false;
+        }
+        
         if (!classConfig.allowedEquipmentTypes.Contains(item.config.equipmentType))
         {
-            Debug.Log("无法装备此类型的物品");
+            Debug.Log($"[CharacterData] 无法装备此类型的物品：{item.config.equipmentType}");
             return false;
         }
         
         if (item.config.requiredLevel > level)
         {
-            Debug.Log("等级不足，无法装备");
+            Debug.Log($"[CharacterData] 等级不足，无法装备：需要 {item.config.requiredLevel} 级，当前 {level} 级");
             return false;
         }
         
         EquipmentSlot slot = item.config.slot;
+        int itemId = item.config.equipmentId;
+        
+        if (_equippedItemIds.Contains(itemId))
+        {
+            Debug.LogWarning($"[CharacterData] 物品 {item.config.equipmentName} (ID:{itemId}) 已经装备在身上！");
+            return false;
+        }
+        
+        Debug.Log($"[CharacterData] 开始装备物品：{item.config.equipmentName} (ID:{itemId}) 到槽位：{slot}");
+        
+        EquipmentInstance oldItem = null;
         
         if (equippedItems.ContainsKey(slot) && equippedItems[slot] != null)
         {
-            inventory.Add(equippedItems[slot]);
+            oldItem = equippedItems[slot];
+            int oldItemId = oldItem.config.equipmentId;
+            
+            Debug.Log($"[CharacterData] 槽位 {slot} 已有装备：{oldItem.config.equipmentName} (ID:{oldItemId})，将其移回背包");
+            
+            _equippedItemIds.Remove(oldItemId);
+            inventory.Add(oldItem);
         }
         
         equippedItems[slot] = item;
-        inventory.Remove(item);
+        
+        bool removedFromInventory = inventory.Remove(item);
+        if (!removedFromInventory)
+        {
+            Debug.LogWarning($"[CharacterData] 物品 {item.config.equipmentName} 不在背包中，但仍然装备成功");
+        }
+        
+        _equippedItemIds.Add(itemId);
+        _isStatsDirty = true;
         
         CalculateTotalStats();
         
-        Debug.Log($"装备了：{item.config.equipmentName}");
+        Debug.Log($"[CharacterData] 装备完成：{item.config.equipmentName}，当前总属性：{_totalStats}");
+        
         return true;
     }
     
     public void UnequipItem(EquipmentSlot slot)
     {
-        if (equippedItems.ContainsKey(slot) && equippedItems[slot] != null)
+        if (!equippedItems.ContainsKey(slot) || equippedItems[slot] == null)
         {
-            inventory.Add(equippedItems[slot]);
-            equippedItems[slot] = null;
+            Debug.LogWarning($"[CharacterData] 槽位 {slot} 没有可卸下的装备");
+            return;
+        }
+        
+        EquipmentInstance itemToUnequip = equippedItems[slot];
+        int itemId = itemToUnequip.config.equipmentId;
+        
+        Debug.Log($"[CharacterData] 开始卸下装备：槽位={slot}, 物品={itemToUnequip.config.equipmentName} (ID:{itemId})");
+        
+        if (!_equippedItemIds.Contains(itemId))
+        {
+            Debug.LogWarning($"[CharacterData] 物品 {itemToUnequip.config.equipmentName} 不在已装备列表中，但仍然从槽位卸下");
+        }
+        else
+        {
+            _equippedItemIds.Remove(itemId);
+        }
+        
+        inventory.Add(itemToUnequip);
+        equippedItems[slot] = null;
+        _isStatsDirty = true;
+        
+        CalculateTotalStats();
+        
+        Debug.Log($"[CharacterData] 卸下装备完成：{itemToUnequip.config.equipmentName}，当前总属性：{_totalStats}");
+    }
+    
+    public void ForceRecalculateStats()
+    {
+        Debug.Log("[CharacterData] 强制重新计算属性...");
+        _isStatsDirty = true;
+        CalculateTotalStats();
+    }
+    
+    public void ValidateEquippedItems()
+    {
+        Debug.Log("[CharacterData] 开始验证装备状态...");
+        
+        HashSet<int> actualItemIds = new HashSet<int>();
+        int validCount = 0;
+        int invalidCount = 0;
+        
+        foreach (var kvp in equippedItems)
+        {
+            EquipmentSlot slot = kvp.Key;
+            EquipmentInstance item = kvp.Value;
+            
+            if (item == null || item.config == null)
+            {
+                Debug.LogWarning($"[CharacterData] 槽位 {slot} 中的装备为空或配置无效");
+                invalidCount++;
+                continue;
+            }
+            
+            int itemId = item.config.equipmentId;
+            
+            if (actualItemIds.Contains(itemId))
+            {
+                Debug.LogError($"[CharacterData] 检测到严重问题：物品 {item.config.equipmentName} (ID:{itemId}) 在多个槽位中存在！");
+                invalidCount++;
+            }
+            else
+            {
+                actualItemIds.Add(itemId);
+                validCount++;
+            }
+        }
+        
+        if (_equippedItemIds == null)
+        {
+            _equippedItemIds = new HashSet<int>();
+        }
+        
+        bool idsMatch = _equippedItemIds.SetEquals(actualItemIds);
+        
+        if (!idsMatch)
+        {
+            Debug.LogWarning($"[CharacterData] 装备ID缓存与实际槽位不匹配！缓存数量：{_equippedItemIds.Count}, 实际数量：{actualItemIds.Count}");
+            _equippedItemIds = actualItemIds;
+            _isStatsDirty = true;
             CalculateTotalStats();
         }
+        
+        Debug.Log($"[CharacterData] 装备验证完成 - 有效装备：{validCount}, 无效装备：{invalidCount}, ID缓存匹配：{idsMatch}");
     }
     
     public void TakeDamage(int damage)
@@ -172,7 +372,35 @@ public class CharacterData
     
     private void Die()
     {
-        Debug.Log("角色死亡！");
+        Debug.Log("[CharacterData] 角色死亡！");
+    }
+    
+    public string GetDebugInfo()
+    {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        sb.AppendLine("=== 角色属性调试信息 ===");
+        sb.AppendLine($"角色：{characterName} (等级 {level})");
+        sb.AppendLine($"基础属性：{_baseStats}");
+        sb.AppendLine($"装备加成：{_equipmentStatsCache}");
+        sb.AppendLine($"总属性：{_totalStats}");
+        sb.AppendLine($"属性需要刷新：{_isStatsDirty}");
+        sb.AppendLine($"\n已装备物品 (数量：{_equippedItemIds.Count})：");
+        
+        foreach (var kvp in equippedItems)
+        {
+            if (kvp.Value != null && kvp.Value.config != null)
+            {
+                sb.AppendLine($"  槽位 {kvp.Key}: {kvp.Value.config.equipmentName} (ID:{kvp.Value.config.equipmentId})");
+            }
+        }
+        
+        sb.AppendLine($"\n装备ID缓存 (数量：{_equippedItemIds.Count})：");
+        foreach (int id in _equippedItemIds)
+        {
+            sb.AppendLine($"  ID: {id}");
+        }
+        
+        return sb.ToString();
     }
 }
 
@@ -206,27 +434,63 @@ public class EquipmentInstance
     public List<AffixInstance> prefixes;
     public List<AffixInstance> suffixes;
     
+    private CharacterStats _cachedStats;
+    private bool _isCacheDirty = true;
+    
     public CharacterStats GetTotalStats()
     {
-        CharacterStats stats = config.baseStats;
+        if (_isCacheDirty || _cachedStats == null)
+        {
+            CalculateStats();
+        }
+        return _cachedStats;
+    }
+    
+    private void CalculateStats()
+    {
+        if (config == null)
+        {
+            _cachedStats = new CharacterStats();
+            _isCacheDirty = false;
+            return;
+        }
+        
+        _cachedStats = config.baseStats.DeepCopy();
         
         float enhanceMultiplier = 1f + (config.enhanceStatBonusPerLevel * enhanceLevel);
-        stats.maxHealth = Mathf.FloorToInt(stats.maxHealth * enhanceMultiplier);
-        stats.maxMana = Mathf.FloorToInt(stats.maxMana * enhanceMultiplier);
-        stats.attackPower = Mathf.FloorToInt(stats.attackPower * enhanceMultiplier);
-        stats.defense = Mathf.FloorToInt(stats.defense * enhanceMultiplier);
+        _cachedStats.maxHealth = Mathf.FloorToInt(_cachedStats.maxHealth * enhanceMultiplier);
+        _cachedStats.maxMana = Mathf.FloorToInt(_cachedStats.maxMana * enhanceMultiplier);
+        _cachedStats.attackPower = Mathf.FloorToInt(_cachedStats.attackPower * enhanceMultiplier);
+        _cachedStats.defense = Mathf.FloorToInt(_cachedStats.defense * enhanceMultiplier);
         
-        foreach (var prefix in prefixes)
+        if (prefixes != null)
         {
-            stats += prefix.GetStats();
+            foreach (var prefix in prefixes)
+            {
+                if (prefix != null)
+                {
+                    _cachedStats += prefix.GetStats();
+                }
+            }
         }
         
-        foreach (var suffix in suffixes)
+        if (suffixes != null)
         {
-            stats += suffix.GetStats();
+            foreach (var suffix in suffixes)
+            {
+                if (suffix != null)
+                {
+                    _cachedStats += suffix.GetStats();
+                }
+            }
         }
         
-        return stats;
+        _isCacheDirty = false;
+    }
+    
+    public void MarkDirty()
+    {
+        _isCacheDirty = true;
     }
 }
 
@@ -238,7 +502,14 @@ public class AffixInstance
     
     public CharacterStats GetStats()
     {
-        float multiplier = value / (config.maxValue - config.minValue);
+        if (config == null)
+        {
+            return new CharacterStats();
+        }
+        
+        float denominator = config.maxValue - config.minValue;
+        float multiplier = denominator > 0 ? value / denominator : 0f;
+        
         CharacterStats stats = new CharacterStats();
         
         stats.maxHealth = Mathf.FloorToInt(config.stats.maxHealth * multiplier);
